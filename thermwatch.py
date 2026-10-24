@@ -463,26 +463,47 @@ def sync_names(devices: dict) -> int:
             "SELECT name, address FROM readings GROUP BY name, address"
         ).fetchall()
         by_name = {n: a for a, n in devices.items()}
+
+        def drop_clash(stored: str, addr: str, want: str) -> int:
+            """Rows that already exist under the name the config uses now.
+
+            The same sample can be stored twice - once under the old name, from
+            before a rename, and once under the current one - and the unique
+            index is on (ts_utc, name, address, key), so a plain rename would
+            collide. The duplicate is dropped first, then the rest are renamed;
+            the count is reported so a merge is not silent.
+            """
+            return con.execute(
+                "DELETE FROM readings WHERE name = :n AND address = :a AND "
+                "EXISTS (SELECT 1 FROM readings AS other WHERE other.name = :w "
+                "AND other.ts_utc = readings.ts_utc AND other.key = readings.key)",
+                {"n": stored, "a": addr, "w": want}).rowcount
+
         for stored, addr in pairs:
             want = devices.get(addr)
             if want and want != stored:
+                gone = drop_clash(stored, addr, want)
                 n = con.execute("SELECT COUNT(*) FROM readings WHERE "
-                                "address = ? AND name = ?", (addr, stored)
-                                ).fetchone()[0]
-                con.execute("UPDATE readings SET name = ? WHERE address = ?",
-                            (want, addr))
+                                "name = :n AND address = :a",
+                                {"n": stored, "a": addr}).fetchone()[0]
+                con.execute("UPDATE readings SET name = :w WHERE "
+                            "name = :n AND address = :a",
+                            {"w": want, "n": stored, "a": addr})
                 changed += n
-                print(f"[sync] {addr}: {stored} -> {want} ({n} row(s))")
+                print(f"[sync] {addr}: {stored} -> {want} "
+                      f"({n} row(s) renamed, {gone} duplicate(s) dropped)")
             real = by_name.get(stored)
             if real and real != addr and not is_address(addr) and is_address(real):
+                gone = drop_clash(stored, addr, stored)
                 n = con.execute("SELECT COUNT(*) FROM readings WHERE "
-                                "address = ? AND name = ?", (addr, stored)
-                                ).fetchone()[0]
-                con.execute("UPDATE readings SET address = ? WHERE "
-                            "address = ? AND name = ?", (real, addr, stored))
+                                "name = :n AND address = :a",
+                                {"n": stored, "a": addr}).fetchone()[0]
+                con.execute("UPDATE readings SET address = :r WHERE "
+                            "name = :n AND address = :a",
+                            {"r": real, "n": stored, "a": addr})
                 changed += n
                 print(f"[sync] {stored}: address {addr} -> {real} "
-                      f"({n} row(s))")
+                      f"({n} row(s) moved, {gone} duplicate(s) dropped)")
     return changed
 
 

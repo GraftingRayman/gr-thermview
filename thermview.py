@@ -107,18 +107,23 @@ ZONES = ("UTC", "Europe/London", "Europe/Paris", "Europe/Istanbul",
          "Asia/Karachi", "Asia/Kolkata", "America/New_York",
          "America/Los_Angeles", "Australia/Sydney")
 LOW_BATTERY = 50.0     # at or below this, a device's name flashes
+UNIT = None            # "C" or "F" for this request; None means the saved one
 
 
 TZ = None            # the zone this request draws in; set per request
 
 
-def display_zone() -> str:
-    """The zone the settings screen saved, UTC when nothing has."""
+def display_doc() -> dict:
+    """What the settings screen saved - a zone and a unit; {} when nothing has."""
     try:
-        return str(json.loads(DISPLAY.read_text(encoding="utf-8")).get("tz",
-                                                             "UTC"))
+        return json.loads(DISPLAY.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return "UTC"
+        return {}
+
+
+def write_display(doc: dict) -> None:
+    DISPLAY.write_text(json.dumps(doc, indent=1, ensure_ascii=False) + "\n",
+                       encoding="utf-8")
 
 
 def save_zone(name: str) -> str:
@@ -127,26 +132,66 @@ def save_zone(name: str) -> str:
         ZoneInfo(name)                      # a name with no data is refused
     except Exception:
         return ""
-    DISPLAY.write_text(json.dumps({"tz": name}, indent=1) + "\n",
-                       encoding="utf-8")
+    doc = display_doc()
+    doc["tz"] = name
+    write_display(doc)
     return name
 
 
-def pick_zone(params: dict) -> str:
-    """Set the zone this request draws in, and say what it is called.
+def save_unit(name: str) -> str:
+    """Write the display unit. Returns "C" or "F"; anything else is refused."""
+    got = ("F" if str(name).upper().startswith("F") else
+           "C" if str(name).upper().startswith("C") else "")
+    if not got:
+        return ""
+    doc = display_doc()
+    doc["unit"] = got
+    write_display(doc)
+    return got
 
-    `?tz=` wins over the saved choice, so a shared link shows the same times
-    whoever opens it. A name the system has no data for falls back to UTC and
-    says so - a wrong time quietly is the thing this must never do.
+
+def pick_display(params: dict) -> tuple:
+    """Set the zone and the unit this request draws in; say what they are called.
+
+    `?tz=` and `?unit=` win over the saved choice, so a shared link shows the
+    same times and the same degrees whoever opens it. A zone with no data falls
+    back to UTC and says so; a unit that is not C or F stays Celsius.
     """
-    global TZ
-    name = (params.get("tz") or [display_zone()])[0]
+    global TZ, UNIT
+    name = (params.get("tz") or [display_doc().get("tz", "UTC")])[0]
     try:
         TZ = ZoneInfo(name)
     except Exception:
         TZ = ZoneInfo("UTC")
-        name = "UTC"
-    return TZ.tzname(now()) if name != "UTC" else "UTC"
+    unit = str((params.get("unit") or [display_doc().get("unit", "C")])[0])
+    UNIT = "F" if unit.upper().startswith("F") else "C"
+    return (TZ.tzname(now()) if name != "UTC" else "UTC"), unit_of("temperature")
+
+
+def unit_now() -> str:
+    """The unit this request draws temperatures in."""
+    return UNIT or "C"
+
+
+def conv(value: float, kind: str) -> float:
+    """A stored value as this page draws it. Only temperature converts.
+
+    The store keeps °C and always will - a unit only decides how a number is
+    written, so changing it moves no data and breaks no filter. Humidity is a
+    percentage, battery a percentage and signal a decibel: none of them is a
+    temperature, so none of them is converted.
+    """
+    if kind == "temperature" and unit_now() == "F":
+        return value * 9 / 5 + 32
+    return value
+
+
+def unit_of(kind: str) -> str:
+    """The unit a value of this kind is drawn with."""
+    if kind == "temperature":
+        return "°F" if unit_now() == "F" else "°C"
+    return {"humidity": "%", "battery": "%",
+            "signal_strength": "dBm"}.get(kind, "")
 
 
 def show(when: datetime) -> datetime:
@@ -297,7 +342,8 @@ def scene(kind: str, unit: str, title: str, by_device: dict,
     ("poly",[(x,y)...],colour,width) ("dot",cx,cy,r,colour) or
     ("text",x,y,words,size,colour,anchor).
     """
-    pts = by_device
+    pts = {d: [(t, conv(v, kind)) for t, v in vs]
+           for d, vs in by_device.items()}
     all_v = [v for vs in pts.values() for _t, v in vs]
     if not all_v:
         return [("text", PAD_L, H / 2, f"{title}: no points in this range",
@@ -526,7 +572,7 @@ def graph(kind: str, unit: str, title: str, by_device: dict, names: list) -> str
 
 
 def graph_svg(params: dict, kind: str) -> bytes:
-    pick_zone(params)   # a /graph image is drawn in the zone the page asked for
+    pick_display(params)   # a /graph image is drawn in the zone and unit asked for
     """One graph as a standalone SVG document, for the image route.
 
     The same primitives `graph` draws - no title inside, the page already has
@@ -617,10 +663,11 @@ def live_text(addr: str) -> str:
             return "connected, waiting for a reading"
         return "no live reading yet"
     parts = []
-    for kind, unit, _title in LIVE_KINDS:
+    for kind, _unit, _title in LIVE_KINDS:
         v = got["values"].get(kind)
         if v:
-            parts.append(f"{_title.lower()} {v[0]:.1f} {v[1] or unit}")
+            parts.append(f"{_title.lower()} {conv(v[0], kind):.1f} "
+                         f"{unit_of(kind) or v[1]}")
     stamp = show(datetime.fromisoformat(got["ts"])).strftime("%H:%M:%S")
     if not parts:
         return "connected, no reading"
@@ -718,6 +765,10 @@ LIVE_JS = ("<script>async function pull(){try{"
 # zone applies straight away instead of waiting for a submit button.
 PICK_JS = ("<script>function pick(el){var b=el.getAttribute('data-base');"
            "if(!b)return;location.href=b+(el.value?encodeURIComponent(el.value):'');}"
+           "function wire(){for(const s of document.querySelectorAll("
+           "\"select[data-base]\"))s.onchange=()=>pick(s);}"
+           "if(document.readyState=='complete')wire();"
+           "else document.addEventListener('DOMContentLoaded',wire);"
            "</script>")
 
 
@@ -796,6 +847,20 @@ def keep_of(params: dict) -> str:
     return "&".join(parts)
 
 
+def put_first(current: str, items: list, key=lambda v: v) -> list:
+    """The dropdown's options with the one in use first.
+
+    A browser leaves a `<select>` on its first option, so a page that is
+    showing one thing and offers another opens with the dropdown already lying:
+    clicking what it already shows changes nothing, and no change event fires -
+    which is how a setting that is already in use looked unselectable. Starting
+    the list at what is in use makes the untouched dropdown agree with the page,
+    and every click a real change. `key` picks the value out of an option when
+    an option is a (value, label) pair rather than a bare value.
+    """
+    return sorted(items, key=lambda v: key(v) != current)
+
+
 def ranges_form(params: dict) -> str:
     """The window the graphs cover, as a dropdown that applies on selection.
 
@@ -804,20 +869,22 @@ def ranges_form(params: dict) -> str:
     script that turns the choice into the address it would have produced -
     `/?dev=…&range=…` - and goes there. The option in use is marked, so the
     page says what it is showing. With no script the month grid beside it still
-    reaches any day, so the view is reachable either way.
+    reaches any day, so the view is reachable either way. The option in use is
+    also the first one, so an untouched dropdown already shows what the page is
+    showing and every click is a change the script can see.
     """
     dev = _q(params["dev"][0]) if params.get("dev") else "*"
     base = f"/?dev={dev}&range="
     cur = (params.get("range", [""])[0] or "")
+    windows = [("", "all data")] + [(key, label) for key, label, _h in RANGES]
     opts = "".join(f'<option value="{key}">{esc(label)}'
                    f'{" · shown now" if key == cur else ""}</option>'
-                   for key, label, _h in RANGES)
+                   for key, label in put_first(cur, windows,
+                                               key=lambda kv: kv[0]))
     return (f"<p class='m'>the window the graphs cover - "
-            "pick one, it applies straight away</p>"
+            "pick one, it applies straight away</p><form>"
             f"<select class='r' data-base='{esc(base)}' "
-            f"onchange='pick(this)'>"
-            f"<option value=''>all data"
-            f"{' · shown now' if not cur else ''}</option>{opts}</select>")
+            f"onchange='pick(this)'>{opts}</select></form>")
 
 
 def aside_html(params: dict, names: list) -> str:
@@ -977,12 +1044,13 @@ def page(params: dict) -> str:
 
     kinds = kinds_of(params)
     keep = keep_of(params)
-    zone = pick_zone(params)      # the header says what the times are in
+    zone, degrees = pick_display(params)   # the header says what it draws in
     body = [
         "<h1>thermview</h1>",
         f"<p class='m'>{label} · {nrows} value row(s) · "
         f"{len(selected)} of {len(all_names)} device(s) shown · "
-        f"graphs: {len(kinds)} of {len(KINDS)} · times in {zone}</p>",
+        f"graphs: {len(kinds)} of {len(KINDS)} · times in {zone} · "
+        f"temperatures in {degrees}</p>",
         graph_links(params),
         shot_links(params),
         "<div class='wrap'><div class='side'>",
@@ -993,7 +1061,7 @@ def page(params: dict) -> str:
         got = series.get(kind, {})
         if not got:
             continue
-        body.append(f"<h2 class='m'>{esc(title)} ({esc(unit)})</h2>")
+        body.append(f"<h2 class='m'>{esc(title)} ({esc(unit_of(kind))})</h2>")
         body.append(key_html([n for n in selected if n in got]))
         body.append("<p class='m'>a break in a line is a period with no data, "
                     "not a flat reading</p>")
@@ -1233,6 +1301,25 @@ def apply_device(fields: dict) -> list:
     return notes
 
 
+def unit_form() -> str:
+    """The dropdown the settings screen offers for the temperature unit.
+
+    Same shape as the window and the zone: choosing applies straight away, and
+    the choice is saved in display.json. Only temperature converts - humidity,
+    battery and signal are not temperatures.
+    """
+    cur = display_doc().get("unit", "C")
+    cur = "F" if str(cur).upper().startswith("F") else "C"
+    opts = "".join(f'<option value="{u}">'
+                   f"{'°C' if u == 'C' else '°F'}"
+                   f'{" · in use" if u == cur else ""}</option>'
+                   for u in put_first(cur, ["C", "F"]))
+    return (f"<p class='m'>temperatures are drawn in - pick one, it applies "
+            "straight away</p><form>"
+            "<select class='u' data-base='/devices?unit=' "
+            "onchange='pick(this)'>" + opts + "</select></form>")
+
+
 def zone_form() -> str:
     """The dropdown the settings screen offers for the display zone.
 
@@ -1240,14 +1327,14 @@ def zone_form() -> str:
     `/devices?tz=<name>`, which saves the choice in display.json and redraws
     this screen - so the setting is not one click behind a Save button.
     """
-    cur = display_zone()
+    cur = str(display_doc().get("tz", "UTC"))
     opts = "".join(f'<option value="{z}">{z}'
                    f'{" · in use" if z == cur else ""}</option>'
-                   for z in ZONES)
+                   for z in put_first(cur, list(ZONES)))
     return (f"<p class='m'>the graphs and the live readings are shown in - "
-            "pick one, it applies straight away</p>"
+            "pick one, it applies straight away</p><form>"
             f"<select class='tz' data-base='/devices?tz=' "
-            f"onchange='pick(this)'>{opts}</select>")
+            f"onchange='pick(this)'>{opts}</select></form>")
 
 
 def devices_page(params: dict, report: list = ()) -> str:
@@ -1283,7 +1370,14 @@ def devices_page(params: dict, report: list = ()) -> str:
             (f"the display zone is now {got} - every page shows times in it"
              if got else
              f"'{name}' has no zone data here - the choice was not saved")]
-    pick_zone(params)
+    if params.get("unit"):
+        got = save_unit(params["unit"][0])
+        report = list(report) + [
+            (f"temperatures are now drawn in {got} - the store still keeps "
+             "°C, nothing was converted in it"
+             if got else
+             f"'{params['unit'][0]}' is not a unit - the choice was not saved")]
+    pick_display(params)
     # The view you came from is part of this screen: the range, the date and
     # the devices chosen are carried so "back to the graphs" lands where you
     # were, and a form answer shows the same screen with the same filters.
@@ -1326,7 +1420,7 @@ def devices_page(params: dict, report: list = ()) -> str:
            f"<p class='m'><a class='d' href='/devices?scan={SCAN_S:.0f}"
            f"{f'&{keep}' if keep else ''}'>scan "
            f"{SCAN_S:.0f}s for a device that is paired but not listed</a></p>",
-           zone_form()]
+           zone_form(), unit_form()]
     for r in report:
         out.append(f"<p class='rpt'>{esc(r)}</p>")
     for addr in order:

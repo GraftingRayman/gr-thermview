@@ -434,6 +434,54 @@ data2[:2] == b"\xff\xd8" and ctype2 == "image/jpeg")
     thermview.DISPLAY = real_display
     shutil.rmtree(tmpd)
 
+    # the unit: the dropdown, a saved choice, and only temperature converting
+    settings = Handler.route("/devices")
+    check("settings offers the temperature unit as a dropdown",
+          "select class='u'" in settings and 'value="C"' in settings
+          and 'value="F"' in settings)
+    c_svg = Handler.raw("/graph?k=temperature&range=24h&tz=UTC&unit=C")[1].decode()
+    f_svg = Handler.raw("/graph?k=temperature&range=24h&unit=F")[1].decode()
+    vals = lambda s: [float(x) for x in _re.findall(r'>(-?\d+\.\d)<', s)]
+    check("the axis moves to the chosen unit",
+          len(vals(f_svg)) == len(vals(c_svg)) > 0
+          and all(abs(f - (c * 9 / 5 + 32)) < 0.2
+                  for c, f in zip(vals(c_svg), vals(f_svg))))
+    check("the graph heading names the unit it draws",
+          "(°F)" in Handler.route("/?unit=F&range=24h"))
+    thermview.LIVE[addrs[0]] = {"ts": "2026-10-24T00:00:00+00:00",
+                                "values": {"temperature": (20.0, "C"),
+                                           "humidity": (60.0, "%"),
+                                           "battery": (40.0, "%")},
+                                "model": "H5075"}
+    hot = Handler.route("/?unit=F&range=24h")
+    check("the live reading converts, the humidity and battery do not",
+          "temperature 68.0 °F" in hot and "humidity 60.0 %" in hot
+          and "battery 40.0 %" in hot)
+    check("a bad unit is refused and nothing is saved",
+          "not a unit" in Handler.route("/devices?unit=kelvin")
+          and thermview.display_doc().get("unit") != "kelvin")
+    saved = Handler.route("/devices?unit=F")
+    check("choosing a unit saves it for every page",
+          "temperatures are now drawn in F" in saved
+          and thermview.display_doc().get("unit") == "F")
+    sample = list(Store.con.execute(
+        "SELECT value FROM readings WHERE key = 'temperature' AND "
+        "model != 'imported' LIMIT 1"))
+    saved_page = Handler.route("/devices?unit=F")
+    after = list(Store.con.execute(
+        "SELECT value FROM readings WHERE key = 'temperature' AND "
+        "model != 'imported' LIMIT 1"))
+    check("choosing a unit changes no row - the store keeps °C",
+          sample == after and sample and sample[0][0] < 60)
+    thermview.LIVE.pop(addrs[0], None)
+
+    check("an untouched dropdown already shows what the page is showing",
+          _re.findall(r'<option value="([^"]*)"',
+                      thermview.ranges_form({"range": ["24h"]}))[0] == "24h"
+          and _re.findall(r'<option value="([^"]*)"',
+                          thermview.ranges_form({}))[0] == ""
+          and _re.findall(r'<option value="([CF])"', thermview.unit_form())[0]
+          == "F")
     if Store.con is not None:          # the temp store is still open in it
         try:
             Store.con.close()

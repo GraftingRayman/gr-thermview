@@ -156,6 +156,7 @@ URL parameters, if you want to link straight to a view:
 /?dev=-*                none                /?dev=-OUTSIDE       all but one
 /?range=1h | 24h | 7d | 30d | 1y          fixed ranges (the dropdown picks these)
 /?tz=Europe/London                       show times in that zone (any IANA name)
+/?unit=F                                 draw temperatures in °F (or °C)
 /?date=YYYY-MM-DD                         one day
 /?from=2026-10-01&to=2026-10-31           a span
 /?month=YYYY-MM                          which month the grid shows
@@ -266,18 +267,30 @@ uses them.
 settings checks run against a temp `devices.json` and a temp store, so a real
 one is never rewritten by the test).
 
-## Times and the display zone
+## Units and the display zone
 
-The store keeps UTC and always will — a zone only decides how a time is written,
-so changing it moves no data and breaks no filter. The settings screen offers a
-**dropdown of common zones**; picking one saves it in `display.json` next to the
-scripts (gitignored — a fresh clone starts on UTC) and applies straight away, so
-the **graph axis labels** and the **live readings'** timestamps are drawn in it,
-and the page header says what it is doing (`times in BST`). `?tz=<name>` on any
-page asks for one zone for that view without saving it, so a shared link shows
-the same times whoever opens it. A name the system has no data for is refused,
-said on the page, and left at what it was. The calendar days and the range
-windows stay UTC — only the display moves.
+**Temperatures can be drawn in °C or °F.** The settings screen offers a
+**dropdown** for it, and picking applies straight away: the **graph axis, the
+graph heading, the live readings and the saved shots** all show the chosen unit,
+and the page header says what it is doing (`temperatures in °F`). Humidity, the
+battery and the signal are not temperatures, so they are never converted. **The
+store keeps °C and always will** — a unit only decides how a number is written,
+so changing it converts nothing in the dump and breaks no filter. The choice is
+saved in `display.json` next to the scripts (gitignored — a fresh clone starts on
+°C); `?unit=F` on any page asks for one view without saving it, so a shared link
+shows the same degrees whoever opens it. A unit that is not C or F is refused and
+left at what it was.
+
+Every dropdown on the page — window, unit, zone — lists **the option in use first**,
+marked `· in use` / `· shown now`. A browser leaves a `<select>` on its first
+option, so an untouched dropdown would otherwise sit on a different setting than
+the page is showing, and clicking what it already shows fires nothing — that is
+why a setting that was already in use looked unselectable.
+
+The same screen picks the **time zone** for the graph axis and the live
+readings' timestamps (`?tz=<name>` for one view). The store keeps UTC, and the
+calendar days and the range windows are still UTC — only the display moves. A
+zone the system has no data for is refused and said so rather than shown wrong.
 
 ## A battery that needs attention
 
