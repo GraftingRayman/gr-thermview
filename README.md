@@ -18,10 +18,13 @@ thermwatch.bat --range-seconds 60   a longer range probe
 thermview.bat                       serve the store at http://127.0.0.1:8957/
 ```
 
-<img width="1905" height="1025" alt="image" src="https://github.com/user-attachments/assets/99320a94-3fdf-471e-95f6-103f0611bb98" />
+<!-- Keep these two blocks, alt text included, in every edit of this file:
+     they are the screenshots the GitHub repo shows. The URLs are GitHub
+     attachments, so they render online and not offline. -->
 
-<img width="1903" height="786" alt="image" src="https://github.com/user-attachments/assets/3d0c93e2-6c90-4c99-94d2-984a2ab5b64b" />
+<img width="1905" height="1025" alt="thermview's main screen: the devices on the left with their live readings, the temperature and humidity graphs in the middle, the window dropdown and month grid on the right" src="https://github.com/user-attachments/assets/99320a94-3fdf-471e-95f6-103f0611bb98" />
 
+<img width="1903" height="786" alt="the settings screen: every device with its address and what a removal would take back, the CSV dropdown, the three buttons, and the window/unit/zone dropdowns" src="https://github.com/user-attachments/assets/3d0c93e2-6c90-4c99-94d2-984a2ab5b64b" />
 
 ## Start here
 
@@ -72,7 +75,7 @@ beside it it says so and stops - one `FAIL` line, then `need two devices to
 check the split - nothing to check` - rather than pretending a fresh clone
 passes. Running it writes two shots into `shots/` (gitignored).
 
-**79 checks, 0 failed** — verified 2026-10-24 against a 1.15 M-row store.
+**101 checks, 0 failed** — verified 2026-10-24 against a 1.15 M-row store.
 
 ## `--range`: does a spot work, and how solidly
 
@@ -267,7 +270,7 @@ a fresh thread, which made the store read back empty. The live poller runs in it
 own thread and opens its own connections, which is allowed; the HTTP thread never
 uses them.
 
-`test_view.py` runs the checks offline against the store beside it - 79 checks,
+`test_view.py` runs the checks offline against the store beside it - 101 checks,
 0 failed as of 2026-10-24 (it also writes two shots into `shots/`, and its
 settings checks run against a temp `devices.json` and a temp store, so a real
 one is never rewritten by the test).
