@@ -18,6 +18,11 @@ thermwatch.bat --range-seconds 60   a longer range probe
 thermview.bat                       serve the store at http://127.0.0.1:8957/
 ```
 
+<img width="1905" height="1025" alt="image" src="https://github.com/user-attachments/assets/99320a94-3fdf-471e-95f6-103f0611bb98" />
+
+<img width="1903" height="786" alt="image" src="https://github.com/user-attachments/assets/3d0c93e2-6c90-4c99-94d2-984a2ab5b64b" />
+
+
 ## Start here
 
 1. **Install the dependencies** — see `requirements.txt`, pinned to what this
