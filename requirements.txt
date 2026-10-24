@@ -1,0 +1,15 @@
+# Python 3.12 (3.12.7 on the machine this was built on). Everything else the
+# project uses is standard library: sqlite3, http.server, argparse, csv, json,
+# asyncio, pathlib, datetime, urllib.parse.
+#
+# Install:  python -m pip install -r requirements.txt
+#
+# bleak pulls the winrt-* Windows Bluetooth projections in by itself - they are
+# declared dependencies of bleak (>=3.1); 3.2.1 is what is installed here.
+bleak==3.0.2
+govee-ble==1.5.2
+home-assistant-bluetooth==2.0.0
+
+# Only thermview's JPEG shots need Pillow; the SVG path and everything else
+# work without it.
+Pillow==12.0.0

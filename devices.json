@@ -1,0 +1,7 @@
+{
+  "_note": "address -> name. csv_* entries have no Bluetooth address (their data came from an exported CSV); replace the value with the real 12-hex address when the device is paired.",
+  "Home": "a4c13877928a",
+  "Outside": "a4c138b7179a",
+  "Greenhouse": "a4c138413670",
+  "Upstairs": "a4c1381ea22f"
+}
