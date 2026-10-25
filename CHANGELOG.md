@@ -3,6 +3,37 @@
 Everything here was verified against the store or the page before it was
 written down. Dates are the day the change was made on this machine.
 
+## 2026-10-25 — a device you add is on the page and in the poll right away
+
+The complaint this answers: a thermometer paired with Windows and named from the
+settings screen sat in `devices.json` and appeared nowhere. It was only ever
+listed once it had a reading, and the running viewer had read `devices.json`
+once, at startup, so it was never polled either.
+
+- **The main page lists every device known**, not every device with data: the
+  store's addresses plus any named in `devices.json`. A new one appears in the
+  device menu and the live panel straight away, its live line saying `connected,
+  waiting for a reading`, `not reachable (no active session)` or `no live reading
+  yet`, and the menu header counts what is known. It is not drawn in a graph or
+  a key until it has points — a graph needs them.
+- **The live poll re-reads `devices.json` once a cycle.** A device added while
+  the viewer runs is polled on its next turn; only the addresses not known
+  before get a GATT session opened, so the ones already polling keep theirs. The
+  settings screen's answer now says so: `added <name> at <address> … the live
+  poll reaches it on its next turn`.
+- **A stale paragraph in both READMEs was corrected**: they said the viewer's
+  own live polls were *not* stored. They are — the poll calls the same `store()`
+  a scheduled run does, which is why the last-hour graph moves on the viewer's
+  polls. What is not done is plotting a live reading as an extra newest point.
+- **The suite went from 101 to 108 checks** (7 new: a dataless device is in the
+  menu and says why it has no reading; choosing it by name selects it; it is not
+  drawn in a graph; the poll picks up a device added mid-run; the page is told
+  it is connected). Two test assumptions that had gone stale were fixed on the
+  way — five checks counted devices from the store alone, which stopped matching
+  the screens as soon as `devices.json` named a device with no data; and one
+  asserted the header said `BST`, which is wrong on the day the clocks change,
+  so it now asks the zone what it is called at this moment.
+
 ## 2026-10-24 — a window dropdown, a flashing low battery, a display zone
 
 - **The right column's ranges became a dropdown** — last hour, 24 h, 7 d, 30 d,

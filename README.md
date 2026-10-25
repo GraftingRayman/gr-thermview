@@ -130,7 +130,10 @@ nothing; that is a normal exit (code 0), not an error.
 A device's **identity is its Bluetooth address**; the name in `devices.json` is only a label. Renaming
 one does not create a second device:
 
-- `thermview` reads `devices.json` on every request, so a new name shows up without restarting it;
+- `thermview` reads `devices.json` on every request, so a new name shows up without restarting it — and its
+  live poll re-reads the file once a cycle, so a device **added** there is polled on the next turn and
+  appears on the main page without restarting the viewer (only a session for the new address is opened,
+  the ones already polling keep theirs);
 - `thermwatch.bat --sync-names` rewrites the names already stored in the SQLite file to match the
   config, matched by address (it reports how many rows it changed and is safe to run again);
 - the graphs, the key and the left menu all use the current label, so history follows the rename.
@@ -149,7 +152,7 @@ the new samples go into the same store the graphs read.
 
 | Column | What |
 | --- | --- |
-| Left | the devices. Clicking one **adds or drops it** from the selection while keeping the others, so any subset from none to all is reachable; `all` and `none` links do the obvious thing. Next to each name is its **live reading** - temperature, humidity, battery and signal strength with the time it was taken - or why there is none (`not reachable (no active session)` / `connected, waiting for a reading`). Above the list, one line says how the poll is running. |
+| Left | the devices. The list is every device **known**: the ones with data in the store plus any named in `devices.json` that has none yet — so a thermometer you have just paired or just typed in is on this page straight away, its live line saying `connected, waiting for a reading`, `not reachable (no active session)` or `no live reading yet`. It is not drawn in a graph until it has points. Clicking one **adds or drops it** from the selection while keeping the others, so any subset from none to all is reachable; `all` and `none` links do the obvious thing. Next to each name is its **live reading** - temperature, humidity, battery and signal strength with the time it was taken - or why there is none. Above the list, one line says how the poll is running. |
 | Middle | the graphs - **temperature and humidity only** - and links that switch which of them are drawn: each on its own, both, or `none`. Below them, `save: SVG · JPG · saved shots`. Battery and signal strength are read, stored and shown in the live panel, but they are not drawn as graphs. |
 | Right | a **dropdown for the window** the graphs cover — last hour, 24 h, 7 d, 30 d, last year, all data — and a month grid whose days link to that day; days with samples say how many, empty days are plain text. Picking a window applies straight away, no submit button: the page's own script turns the choice into the address it would have produced (`/?dev=…&range=…`) and goes there. The option in use is marked `· shown now`, so the page says what it is showing. |
 
@@ -219,10 +222,11 @@ with a standalone SVG document — the same primitives the page draws, no title
 inside, since the heading is already above it. With `--live-refresh 0` even the
 last-hour page goes back to inline SVG.
 
-What the graph can show is what is **in the store**: the viewer's own live polls
-are not stored, so the last-hour graph moves when `thermwatch.bat` writes a
-sample, not on every poll. Plotting the live readings as the newest point is not
-done.
+What the graph can show is what is **in the store**, and the viewer's own live
+polls write into that store: each reading it takes is stored the same way a
+scheduled run's is, so the last-hour graph moves on the viewer's polls as well
+as on `thermwatch.bat`. Plotting a live reading as an extra newest point is not
+done - the point is already in the store the moment the poll takes it.
 
 ## The settings screen (`/devices`)
 
@@ -239,7 +243,11 @@ of the CSVs in `historical/`, and **three buttons**.
 - **Save this device** writes `devices.json` and, when a file was chosen, stores
   that file for that device through the same importer `--import` uses. An empty
   name box writes nothing, a name another device already uses is refused, and a
-  name starting with `_` is kept as a note rather than a device.
+  name starting with `_` is kept as a note rather than a device. A device added
+  this way is on the main page from then — the list is every device known, not
+  every device with data — and the viewer's live poll reaches it on its next
+  turn, so a paired thermometer needs nothing else; its first reading is what
+  makes a graph for it.
 - **Remove this file's data** takes back exactly the rows that file would add —
   the inverse of an import, for the mistake it makes. A row is only taken back
   when it matches **identically**: timestamp, address, key, value and unit must
@@ -323,8 +331,8 @@ library. `bleak` pulls the `winrt-*` Windows Bluetooth projections in by itself
   nothing on this PC - verified, not assumed. The archive is filled by the
   scheduled samples and by `--import <csv> --device <name>`, which stores a CSV
   the phone app exported.
-- **The viewer's live polls are not stored**, so the last-hour graph moves when
-  a sample is written, not on every poll. Plotting the live reading as the
-  newest point is not done.
+- **The viewer's live polls are stored**, into the same file a scheduled run
+  writes; the last-hour graph moves on either. What is not done is plotting a
+  live reading as an extra newest point — the point is in the store already.
 - **Battery and signal strength are stored and shown live, but never graphed.**
   Only temperature and humidity are drawn.

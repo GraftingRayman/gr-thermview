@@ -282,6 +282,21 @@ class StoreView:
 Store = StoreView()
 
 
+def known_addresses() -> list:
+    """Every device the view may list: the store's, then any named in devices.json
+    that has no readings yet.
+
+    A device added from the settings screen is polled and shown before it has a
+    single row in the store, so it appears on the live panel straight away; only
+    the graphs stay as they are, because a graph needs points.
+    """
+    addrs = list(Store.addresses())
+    for a in config_names():
+        if a not in addrs:
+            addrs.append(a)
+    return addrs
+
+
 def parse(path: str) -> tuple[str, dict]:
     """`/…?a=1&b=2` -> (route, params)."""
     if path == "/":
@@ -675,26 +690,45 @@ def live_text(addr: str) -> str:
             + (TZ.tzname(datetime.fromisoformat(got["ts"])) if TZ else "UTC"))
 
 
-async def live_forever(devices: dict, interval: float, turn_scan: float,
-                      connect_wait: float) -> None:
+async def live_forever(interval: float, turn_scan: float,
+                       connect_wait: float) -> None:
     """Keep the GATT sessions open and poll the devices one at a time.
 
     One cycle takes the next device in the rotation and runs a short active
     scan for it, so two thermometers never compete for the adapter at once.
+
+    devices.json is re-read at the top of every cycle, so a device added from
+    the settings screen is polled on the next turn without restarting the viewer;
+    only the addresses that were not known before get a session opened, so the
+    ones already polling keep theirs.
     """
     import thermwatch  # sits in the same folder
 
-    sessions, connected = await thermwatch.open_sessions(
-        list(devices), connect_wait)
-    LIVE_INFO["connected"] = connected
-    order = list(devices)
+    sessions, connected, order = [], {}, []
     i = 0
     LIVE_INFO["started"] = datetime.now(timezone.utc).isoformat(
         timespec="seconds")
     while True:
+        devices = config_names()
+        new = [a for a in devices if a not in connected]
+        if new:
+            got, got_conn = await thermwatch.open_sessions(new, connect_wait)
+            # A GATT session only holds its device while this process still has
+            # the object, so every session opened stays in this list.
+            sessions += got
+            connected.update(got_conn)
+            print(f"[live] devices.json names {len(new)} device(s) not polled "
+                  "before - sessions opened", flush=True)
+        if set(devices) != set(order):
+            order = list(devices)
+            i = 0
+        LIVE_INFO["connected"] = connected
+        if not order:
+            await asyncio.sleep(max(interval - turn_scan, 0.5))
+            continue
         addr = order[i % len(order)]
         i += 1
-        LIVE_INFO["next"] = order[i % len(order)] if order else None
+        LIVE_INFO["next"] = order[i % len(order)]
         found = await thermwatch.scan(turn_scan)
         # Whatever answered gets stored, so a scan that catches the other
         # thermometer is not thrown away; the rotation decides which one to
@@ -713,15 +747,18 @@ async def live_forever(devices: dict, interval: float, turn_scan: float,
         await asyncio.sleep(max(interval - turn_scan, 0.5))
 
 
-def start_live(devices: dict, interval: float, turn_scan: float,
+def start_live(interval: float, turn_scan: float,
                connect_wait: float) -> None:
-    """Run live_forever in its own thread; the HTTP server stays single."""
+    """Run live_forever in its own thread; the HTTP server stays single.
+
+    No device list is passed in: the poll reads devices.json itself, once a
+    cycle, so the settings screen can add one while this is running.
+    """
     LIVE_INFO["note"] = "starting"
 
     def run():
         try:
-            asyncio.run(live_forever(devices, interval, turn_scan,
-                                     connect_wait))
+            asyncio.run(live_forever(interval, turn_scan, connect_wait))
         except Exception as e:            # a dead device must not kill the page
             LIVE_INFO["note"] = f"stopped: {e}"
             print(f"[live] stopped: {e}", flush=True)
@@ -737,13 +774,11 @@ def live_status(all_count: int) -> str:
 
 def live_state() -> dict:
     """The live panel as data - every device is listed, so a span that went
-    stale is rewritten too, not only the ones that still answer.
+    stale is rewritten too, not only the ones that still answer. A device named
+    in devices.json but never polled is listed as well, saying why.
     """
-    addrs = list(Store.addresses())
-    for a in config_names():
-        if a not in addrs:
-            addrs.append(a)
-    return {"status": live_status(len(Store.addresses())),
+    addrs = known_addresses()
+    return {"status": live_status(len(addrs)),
             "devices": {a: {"text": live_text(a),
                             "ts": LIVE.get(a, {}).get("ts", "")}
                         for a in addrs}}
@@ -788,9 +823,11 @@ def live_js(seconds: float) -> str:
 
 def side_html(selected: list, all_names: list, keep: dict) -> str:
     """The device menu. Clicking a device adds or drops it, keeping the rest."""
-    lines = [f"<p class='m'>{len(all_names)} device(s) in the store · "
+    lines = [f"<p class='m'>{len(all_names)} device(s) known · "
              f"selected {len(selected)} · names come from devices.json, so a "
-             "rename is a label, not a new device</p>",
+             "rename is a label, not a new device · one named there is listed "
+             "before it has any data, so a new thermometer shows up on this "
+             "page as soon as it is added</p>",
              f"<p class='m'>live: <span id='lv-status'>"
              f"{esc(live_status(len(all_names)))}</span></p>"]
     low_any = False
@@ -993,7 +1030,7 @@ img.g{width:100%;height:auto}
 
 def series_of(params: dict) -> tuple:
     """(addresses shown, kinds asked for, range text, row count, series)."""
-    all_names = Store.addresses()
+    all_names = known_addresses()
     selected = pick_devices(params.get("dev"), all_names)
     frm, to, desc = span(params)
     if not selected:
@@ -1039,7 +1076,7 @@ def shot_links(params: dict) -> str:
 
 
 def page(params: dict) -> str:
-    all_names = Store.addresses()
+    all_names = known_addresses()
     selected, kinds, label, nrows, series = series_of(params)
 
     kinds = kinds_of(params)
@@ -1133,8 +1170,10 @@ def set_name(address: str, name: str) -> str:
     if hit is None:
         out[name] = address
     write_config(out)
-    return (f"renamed {addr} to {name}" if hit is not None else
-            f"added {name} at {addr}") + " in devices.json"
+    if hit is not None:
+        return f"renamed {addr} to {name}" + " in devices.json"
+    return (f"added {name} at {addr} in devices.json - the live poll reaches "
+            "it on its next turn, so it is on the main page from now")
 
 
 def import_history(name: str, file_name: str) -> str:
@@ -1647,12 +1686,12 @@ def main() -> int:
     tag = args.tag or Path(__file__).resolve().parent.name
     sys.stdout = Prefixed(sys.stdout, tag)
     sys.stderr = Prefixed(sys.stderr, tag)
-    devices = config_names()
     LIVE_INFO["refresh"] = args.live_refresh
-    if args.live_interval > 0 and devices:
+    if args.live_interval > 0:
+        # No device list here: the poll reads devices.json once a cycle, so a
+        # device added from the settings screen is picked up without restarting.
         LIVE_INFO["interval"] = args.live_interval
-        start_live(devices, args.live_interval, args.turn_scan,
-                   args.connect_wait)
+        start_live(args.live_interval, args.turn_scan, args.connect_wait)
     else:
         LIVE_INFO["note"] = "off (--live-interval 0)"
     srv = HTTPServer(("127.0.0.1", args.port), Request)

@@ -241,15 +241,20 @@ data2[:2] == b"\xff\xd8" and ctype2 == "image/jpeg")
     thermwatch.CONFIG, thermwatch.DB = tmp / "devices.json", tmp / "probe.sqlite3"
     thermview.STORE = tmp / "probe.sqlite3"      # the counts read this store
 
+    # What the screens may list is every device known: the store's plus any
+    # named in devices.json that has no data yet. The real config has such
+    # devices (one paired but never sampled), so the counts are taken from the
+    # view's own list, not from the store alone.
+    known = thermview.known_addresses()
     screen = Handler.route("/devices")
     check("the devices screen lists every device known",
-          screen.count("class='dev'") == len(addrs))
+          screen.count("class='dev'") == len(known))
     check("the address is shown and never offered as an edit",
-          all(f"<code>{a}</code>" in screen for a in addrs)
+          all(f"<code>{a}</code>" in screen for a in known)
           and "name='address'" in screen
           and "type='text' name='address'" not in screen)
     check("every device carries a Save button",
-          screen.count("name='save'") == len(addrs))
+          screen.count("name='save'") == len(known))
     check("the dropdown lists what is in historical/",
           "probe one.csv" in screen and "value=''" in screen)
     check("the option value is the file's name, not a quoted one",
@@ -268,7 +273,7 @@ data2[:2] == b"\xff\xd8" and ctype2 == "image/jpeg")
     check("the Save button writes the name to devices.json",
           cfg_now.get(first) == "RenamedProbe")
     check("the address is the same one after the rename",
-          set(cfg_now) == set(addrs))
+          set(cfg_now) == set(known))
     check("the answer says what the CSV added",
           "value row(s) stored" in answer and "renamed" in answer.lower())
     with sqlite3.connect(tmp / "probe.sqlite3") as con:
@@ -292,7 +297,7 @@ data2[:2] == b"\xff\xd8" and ctype2 == "image/jpeg")
 
     # the removal: it takes back one file's rows, not the device's history
     check("every device also offers a remove button",
-          screen.count("name='remove'") == len(addrs))
+          screen.count("name='remove'") == len(known))
     (tmp / "historical" / "probe two.csv").write_text(
         "Time,Temperature,Humidity\n"
         "2026-10-24 03:00:00,20.5,60.0\n"
@@ -336,7 +341,7 @@ data2[:2] == b"\xff\xd8" and ctype2 == "image/jpeg")
 
     # the blunt delete: it must ask first, and only the yes link removes
     check("every device offers a delete as well",
-          screen.count("name='delete'") == len(addrs))
+          screen.count("name='delete'") == len(known))
     ask = Handler.post(f"address={addrs[1]}&delete=delete+all+data")
     with sqlite3.connect(tmp / "probe.sqlite3") as con:
         before = con.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
@@ -356,6 +361,80 @@ data2[:2] == b"\xff\xd8" and ctype2 == "image/jpeg")
     check("the device is still named after its data is gone",
           thermview.config_names().get(addrs[1]) == kept
           and "0 value row(s) came from a historical file" in after_screen)
+
+    # a device named in devices.json that has no data yet: it belongs on the
+    # page (the live panel is where a new thermometer shows up), not in a graph
+    fresh = Handler.route("/")
+    check("every device named in devices.json is on the page",
+          all(f"id='lv-{thermview.norm_address(a)}'" in fresh
+              for a in thermview.config_names()))
+    check("the menu counts what is known, not what has data",
+          f"{len(thermview.config_names())} device(s) known" in fresh)
+    # the temp store holds only the probe rows, so the other configured devices
+    # are exactly the ones with no data - that is the case being checked
+    extra = next((a for a in thermview.config_names()
+                  if a not in Store.addresses()), None)
+    if extra is None:
+        print("note: every configured device has data - the dataless case "
+              "has nothing to check")
+    else:
+        check("a device with no data is still in the device menu",
+              f"id='lv-{thermview.norm_address(extra)}'" in fresh)
+        check("it says there is no live reading rather than hiding",
+              "no live reading yet" in fresh)
+        check("choosing it by name selects it",
+              thermview.pick_devices([thermview.config_names()[extra]],
+                                     thermview.known_addresses()) == [extra])
+        check("a device with no points is not drawn in a graph",
+              f"&#9632; {thermview.esc(thermview.label(extra))}</span>"
+              not in fresh)
+
+    # the live poll re-reads devices.json: a device added while it runs is
+    # polled on its next turn, so nothing has to be restarted
+    import time
+    import asyncio
+    cfg = tmp / "poll.json"
+    cfg.write_text('{"First": "a4c13877928a"}', encoding="utf-8")
+    thermview.CONFIG = cfg
+    calls = {"scan": 0}
+
+    async def fake_sessions(addresses, wait_s):
+        return [], {a: True for a in addresses}
+
+    async def fake_scan(seconds):
+        calls["scan"] += 1
+        if "a4c1381ea22f" in thermview.LIVE:
+            raise RuntimeError("the poll reached the device added mid-run")
+        return {a: (None, None) for a in thermview.config_names()}
+
+    def fake_decode(dev, adv):
+        return {"values": {"temperature": (20.0, "C")}, "model": "test"}
+
+    def fake_store(ts_utc, name, address, decoded):
+        return 1
+
+    real_fns = (thermwatch.open_sessions, thermwatch.scan,
+                thermwatch.decode, thermwatch.store)
+    (thermwatch.open_sessions, thermwatch.scan,
+     thermwatch.decode, thermwatch.store) = (fake_sessions, fake_scan,
+                                            fake_decode, fake_store)
+    thermview.start_live(0.2, 0.0, 0.0)
+    time.sleep(1.2)
+    got_first = "a4c13877928a" in thermview.LIVE
+    cfg.write_text('{"First": "a4c13877928a", "Second": "a4c1381ea22f"}',
+                   encoding="utf-8")
+    time.sleep(2.0)
+    check("a device added while the poll runs is polled without restarting",
+          got_first and "a4c1381ea22f" in thermview.LIVE)
+    check("the page is told it is connected, so it says so on the panel",
+          thermview.LIVE_INFO["connected"].get("a4c1381ea22f") is True)
+    (thermwatch.open_sessions, thermwatch.scan,
+     thermwatch.decode, thermwatch.store) = real_fns
+    for a in ("a4c13877928a", "a4c1381ea22f"):
+        thermview.LIVE.pop(a, None)
+    thermview.LIVE_INFO["connected"] = {}
+    thermview.LIVE_INFO["note"] = "off"
+    (tmp / "poll.json").unlink()
 
     # the view is kept through settings and back
     seven = Handler.route("/?range=7d&dev=*")
@@ -419,8 +498,12 @@ data2[:2] == b"\xff\xd8" and ctype2 == "image/jpeg")
     lon_svg = Handler.raw("/graph?k=temperature&range=24h")[1].decode()
     check("the saved zone moves the graph axis",
           times(lon_svg) != times(utc_svg) and bool(times(lon_svg)))
+    # the header names the zone by what it is called at this moment - a fixed
+    # "BST" would fail on the day the clocks change
+    from zoneinfo import ZoneInfo
     check("the page says what the times are in",
-          "times in BST" in Handler.route("/"))
+          f"times in {ZoneInfo('Europe/London').tzname(thermview.now())}"
+          in Handler.route("/"))
     bad = Handler.route("/devices?tz=Mars/Olympus")
     check("a zone with no data says so and changes nothing",
           "no zone data here" in bad
