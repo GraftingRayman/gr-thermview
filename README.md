@@ -77,6 +77,13 @@ passes. Running it writes two shots into `shots/` (gitignored).
 
 **101 checks, 0 failed** — verified 2026-10-24 against a 1.15 M-row store.
 
+**As of 2026-10-29 this copy's suite and its code are not in line.** The code
+here was copied from the tool folder on 2026-10-29, and that folder's viewer was
+changed on 2026-10-26 in a way that reverted two features the suite still tests:
+`thermview.known_addresses()` is gone, so the suite stops at an `AttributeError`
+and reports no total. Bringing the two in line is a decision about the tool,
+not about this copy — see the CHANGELOG entry for that day.
+
 ## `--range`: does a spot work, and how solidly
 
 It connects the configured devices, runs one active scan, and reports per device:
@@ -118,6 +125,7 @@ Home, at a fixed 4 m, read −44, −51, −56, −66 and −71 dBm across five 
 | Path | What |
 | --- | --- |
 | `devices.json` | `name -> Bluetooth address`. Add a device by adding its address; `--list` prints the addresses the scan sees. |
+| `colours.json` | `address -> #rrggbb` for the colours chosen on the settings screen. A display choice like the zone and the unit — the store keeps readings, this only decides which line is drawn for which device. Absent until a colour is ever chosen. |
 | `thermometer.sqlite3` | `readings` table: one row per sample and value (`ts_utc, name, address, key, value, unit, model`). |
 | `last_run.md` | The report for the most recent sample run. |
 | `range.md` | The report for the most recent `--range` probe. |
@@ -130,10 +138,11 @@ nothing; that is a normal exit (code 0), not an error.
 A device's **identity is its Bluetooth address**; the name in `devices.json` is only a label. Renaming
 one does not create a second device:
 
-- `thermview` reads `devices.json` on every request, so a new name shows up without restarting it — and its
-  live poll re-reads the file once a cycle, so a device **added** there is polled on the next turn and
-  appears on the main page without restarting the viewer (only a session for the new address is opened,
-  the ones already polling keep theirs);
+- `thermview` reads `devices.json` on every request, so a new name shows up without restarting it — but its
+  live poll reads the file **once, at startup**, so a device **added** there is
+  polled only after the viewer is started again, and it appears on the main page
+  only once it has a reading (the page lists the devices the store has rows for);
+  the next scheduled `thermwatch.bat` run picks it up on its own;
 - `thermwatch.bat --sync-names` rewrites the names already stored in the SQLite file to match the
   config, matched by address (it reports how many rows it changed and is safe to run again);
 - the graphs, the key and the left menu all use the current label, so history follows the rename.
@@ -228,11 +237,25 @@ scheduled run's is, so the last-hour graph moves on the viewer's polls as well
 as on `thermwatch.bat`. Plotting a live reading as an extra newest point is not
 done - the point is already in the store the moment the poll takes it.
 
+**A device's colour is its own.** The square next to a name in the left panel,
+the square in the key above a graph and the line drawn for that device all ask
+the same function for the colour, looked up by the device rather than by its
+place in a list. Choosing a subset with `dev=` therefore never moves a colour:
+a device that is blue on the panel is the blue line in the graph, even when it is
+the third device drawn. The order the colours come from is the store's device
+list (`ORDER BY address`), so they do not shift between requests; a device named
+in `devices.json` that has no readings yet takes the first colour, which no
+listed device can have taken. A colour chosen on the settings screen wins over
+that palette slot.
+
 ## The settings screen (`/devices`)
 
 The left column ends with one link: **settings**. The scan is asked for on that
-screen, not in the menu — clicking it runs an 8 s active scan, so it is slow on
-purpose and only happens when you choose it.
+screen, not in the menu — clicking it starts an 8 s active scan **in the
+background** and answers straight away, so you can keep browsing, change the range
+or open the settings again while it works; the screen says `a 8s scan is running
+(3s so far)` until it lands, and the devices that answered appear on the next
+look. A second click while one runs says so and does not start another.
 
 The screen lists every device known **anywhere**: named in `devices.json`, present
 in the store without a name, or answered a scan. Each one is a block with its
@@ -244,10 +267,22 @@ of the CSVs in `historical/`, and **three buttons**.
   that file for that device through the same importer `--import` uses. An empty
   name box writes nothing, a name another device already uses is refused, and a
   name starting with `_` is kept as a note rather than a device. A device added
-  this way is on the main page from then — the list is every device known, not
-  every device with data — and the viewer's live poll reaches it on its next
-  turn, so a paired thermometer needs nothing else; its first reading is what
-  makes a graph for it.
+  this way is on the main page once it has a reading — the page lists the devices
+  the store has rows for — and the viewer's live poll reaches it only after the
+  viewer is started again, because the running poll read `devices.json` once;
+  the next scheduled `thermwatch.bat` run picks it up on its own. Its first
+  reading is what makes a graph for it.
+- **Choose the colour a device is drawn in**: every block has a **row of colour
+  chips** under it — the whole hue wheel, 24 distinct hues as clickable swatches,
+  so a device can be set to any colour and not to one of eight. The first chip is
+  **the tool's pick**, drawn as the colour this device would actually get from the
+  palette, so pressing it is visible rather than a name; the chip in use is
+  **ringed**, and a colour set outside the row (typed into an address) is added as
+  its own chip. Clicking a chip applies it straight away — it is a link to
+  `/devices?address=<addr>&c=<colour>`, which writes `colours.json` **by address**
+  (a rename keeps a device's colour, and a device that is only in the store can be
+  coloured before it is named) and redraws the screen. The swatch here, in the
+  left panel, in a graph's key and the graph line are then all that colour.
 - **Remove this file's data** takes back exactly the rows that file would add —
   the inverse of an import, for the mistake it makes. A row is only taken back
   when it matches **identically**: timestamp, address, key, value and unit must
@@ -274,9 +309,17 @@ silently missing.
 
 The server is deliberately **single-threaded**: one sqlite connection may only be
 used from the thread that created it, and a threaded server hands every request to
-a fresh thread, which made the store read back empty. The live poller runs in its
-own thread and opens its own connections, which is allowed; the HTTP thread never
-uses them.
+a fresh thread, which made the store read back empty. The live poller and the
+settings scan run in their **own** threads and open their own connections, which
+is allowed; the HTTP thread never uses them.
+
+What a page asks the store for is kept while the file stays the same: the device
+list and the month list are walked once per file stamp, not once per device the
+page draws. Over a million reading rows the walk costs about a second, and a page
+asks for the device list once per device in the panel, in the key and in every
+graph line — without that cache a page took 43–59 s here, with it 1.2–1.3 s. The
+cache is dropped when the file moves on disk, so a run that wrote the store —
+scheduled, live or imported — is still seen on the next request.
 
 `test_view.py` runs the checks offline against the store beside it - 101 checks,
 0 failed as of 2026-10-24 (it also writes two shots into `shots/`, and its

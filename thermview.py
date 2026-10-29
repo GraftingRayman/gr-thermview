@@ -43,10 +43,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
+import colorsys
 import json
 import sqlite3
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote
@@ -79,8 +81,103 @@ def label(addr: str) -> str:
     return config_names().get(norm_address(addr), addr)
 
 # Fixed so the same device keeps the same colour across pages.
+# The colours a device can be chosen to be drawn in. The settings screen offers
+# a whole wheel (see `spectrum`), not just these: PALETTE is only what a device
+# with no chosen colour gets, one entry per device in the store's order, so the
+# eight are the fallback, not the limit of what can be picked.
 PALETTE = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd",
            "#8c564b", "#e377c2", "#7f7f7f"]
+
+
+def spectrum(steps: int = 24) -> list:
+    """A whole range of colours, evenly around the hue wheel, as `#rrggbb`.
+
+    The settings screen offers these as clickable chips, so a device can be set
+    to any colour rather than to one of eight - a thermometer that has to be
+    told apart from six others needs more than eight. The wheel is taken at one
+    saturation and one lightness: both ends of that axis are unreadable on the
+    page's dark background (a full-saturation dark hue and a near-white one), so
+    the middle is what every chip can actually be seen as.
+    """
+    return ["#%02x%02x%02x" % tuple(
+        round(255 * v) for v in colorsys.hsv_to_rgb(i / steps, 0.62, 0.72))
+        for i in range(steps)]
+
+
+WHEEL = spectrum(24)
+
+
+def is_colour(value: str) -> bool:
+    """A colour the page can draw: `#rrggbb`.
+
+    Written without a regex because this module has no `re` - the shape is six
+    hex digits behind a hash, and saying that in words is shorter than a pattern
+    here would be.
+    """
+    v = str(value)
+    return (len(v) == 7 and v[0] == "#"
+            and all(c in "0123456789abcdefABCDEF" for c in v[1:]))
+
+
+def colour_doc() -> dict:
+    """What colour each device was chosen to be drawn in, by address."""
+    try:
+        return json.loads(COLOURS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def write_colours(doc: dict) -> None:
+    COLOURS.write_text(json.dumps(doc, indent=1, ensure_ascii=False) + "\n",
+                       encoding="utf-8")
+
+
+def save_colour(addr: str, value: str) -> str | None:
+    """Write one device's colour. Returns what took effect, or None.
+
+    Keyed by the address, because the address is the identity: a rename keeps a
+    device's colour, and a device that is only in the store can be coloured
+    before it is ever named. An empty value means "the tool's pick" - the entry
+    is dropped, so the palette slot comes back rather than a colour being
+    remembered twice. A value that is not `#rrggbb` is refused and writes
+    nothing.
+    """
+    key = norm_address(addr)
+    if not key:
+        return None
+    value = (value or "").strip()
+    doc = colour_doc()
+    if not value:
+        doc.pop(key, None)
+        write_colours(doc)
+        return ""
+    if not is_colour(value):
+        return None
+    doc[key] = value.lower()
+    write_colours(doc)
+    return doc[key]
+
+
+def colour(name: str) -> str:
+    """One device's colour - looked up by the device, never by position.
+
+    The live panel, the key above a graph and the lines in the graph all ask
+    this for the same device, so a colour belongs to the device and not to its
+    place in a list: choosing a subset with `dev=`, or a kind that only some
+    devices have points in, cannot shift a colour. A colour chosen on the
+    settings screen (see save_colour) wins over the palette slot; without one
+    the index is taken from the store's full device list (`ORDER BY address`,
+    so it does not move between requests), and a device that is not in it yet -
+    one named in devices.json with no readings - falls to the first colour,
+    which no listed device can have taken.
+    """
+    chosen = colour_doc().get(norm_address(name), "")
+    if is_colour(chosen):
+        return chosen
+    addrs = Store.addresses()
+    return PALETTE[addrs.index(name) % len(PALETTE)] if name in addrs \
+        else PALETTE[0]
+
 
 KINDS = (("temperature", "°C", "Temperature"), ("humidity", "%", "Humidity"))
 
@@ -90,6 +187,13 @@ LIVE_KINDS = KINDS + (("battery", "%", "Battery"),
                       ("signal_strength", "dBm", "Signal strength"))
 
 SHOTS = Path(__file__).resolve().parent / "shots"
+
+# What colour each device is drawn in. Like the zone and the unit, this is a
+# display choice, not data: the store keeps readings, a colour only decides
+# which line is drawn for which device. Keyed by address, because the address
+# is the identity - a rename keeps a device's colour. No entry means the
+# palette slot, which is what the settings screen calls "the tool's pick".
+COLOURS = Path(__file__).resolve().parent / "colours.json"
 
 # Where the phone app's CSV exports live (see `--import` in thermwatch). The
 # devices screen lists what is in here so a file can be chosen for a device;
@@ -227,9 +331,19 @@ def store_stamp() -> tuple:
 
 
 class StoreView:
-    """One open sqlite connection, reopened when the file moves on disk."""
+    """One open sqlite connection, reopened when the file moves on disk.
+
+    The device list and the month list are kept next to it and dropped when the
+    file moves: a page asks for the device list once per device it draws, in the
+    panel, in the key and in every graph line, and re-running that GROUP BY over
+    a million rows each time is what made a page take a minute rather than
+    seconds. The cache is per file stamp, so a run that wrote the store -
+    scheduled or live - is seen on the next request, as it always was.
+    """
     con = None
     stamp = (0, 0)
+    known = None      # the device list, until the file moves on disk
+    known_months = None  # the same for the month list
 
     def refresh(self) -> None:
         s = store_stamp()
@@ -242,6 +356,7 @@ class StoreView:
                 except Exception:
                     pass
             self.con = sqlite3.connect(STORE)
+            self.known = self.known_months = None
             print(f"[store] the file changed while browsing - re-reading it "
                   f"({s[1]} bytes)", flush=True)
         self.stamp = s
@@ -259,42 +374,38 @@ class StoreView:
             return []
 
     def addresses(self) -> list:
+        """Every device the store has rows for, in a stable order.
+
+        Kept in `known` until the file moves on disk (see the class docstring):
+        the page asks for this once per device it draws, so re-running the walk
+        each time is the cost that made a page take a minute.
+        """
         if self.con is None:
             self.refresh()
-        try:
-            return [r[0] for r in self.con.execute(
-                "SELECT address FROM readings GROUP BY address "
-                "ORDER BY address")]
-        except sqlite3.Error:
-            return []
+        if self.known is None:
+            try:
+                self.known = [r[0] for r in self.con.execute(
+                    "SELECT address FROM readings GROUP BY address "
+                    "ORDER BY address")]
+            except sqlite3.Error:
+                return []
+        return list(self.known)
 
     def months(self) -> list:
+        """The months the store has data for, newest first."""
         if self.con is None:
             self.refresh()
-        try:
-            return [r[0] for r in self.con.execute(
-                "SELECT substr(ts_utc,1,7) FROM readings GROUP BY "
-                "substr(ts_utc,1,7) ORDER BY substr(ts_utc,1,7) DESC")]
-        except sqlite3.Error:
-            return []
+        if self.known_months is None:
+            try:
+                self.known_months = [r[0] for r in self.con.execute(
+                    "SELECT substr(ts_utc,1,7) FROM readings GROUP BY "
+                    "substr(ts_utc,1,7) ORDER BY substr(ts_utc,1,7) DESC")]
+            except sqlite3.Error:
+                return []
+        return list(self.known_months)
 
 
 Store = StoreView()
-
-
-def known_addresses() -> list:
-    """Every device the view may list: the store's, then any named in devices.json
-    that has no readings yet.
-
-    A device added from the settings screen is polled and shown before it has a
-    single row in the store, so it appears on the live panel straight away; only
-    the graphs stay as they are, because a graph needs points.
-    """
-    addrs = list(Store.addresses())
-    for a in config_names():
-        if a not in addrs:
-            addrs.append(a)
-    return addrs
 
 
 def parse(path: str) -> tuple[str, dict]:
@@ -429,16 +540,17 @@ def scene(kind: str, unit: str, title: str, by_device: dict,
         out.append(("text", x, H - PAD_B + 16, show(t).strftime("%m-%d %H:%M"), 10,
                     "#8b95a1", "middle"))
     note = ""
-    for n, colour in zip(names, PALETTE):
+    for n in names:
         raw = pts.get(n, [])
         if not raw:
             continue
+        c = colour(n)
         vs, note2 = bucket(raw)
         note = note2 or note
         out.append(("poly", [[(px(t), py(v)) for t, v in part]
-                    for part in path_with_gaps(vs)], colour, 2))
+                    for part in path_with_gaps(vs)], c, 2))
         last_t, last_v = vs[-1]
-        out.append(("dot", px(last_t), py(last_v), 3, colour))
+        out.append(("dot", px(last_t), py(last_v), 3, c))
     if note:
         out.append(("text", W - PAD_R - 4, PAD_T + 10, note, 10, "#8b95a1",
                     "end"))
@@ -638,8 +750,8 @@ def auto_img(kind: str, unit: str, title: str, params: dict) -> str:
 
 
 def key_html(names: list) -> str:
-    items = [f"<span style='color:{c}'>&#9632; {esc(label(n))}</span>"
-             for n, c in zip(names, PALETTE)]
+    items = [f"<span style='color:{colour(n)}'>&#9632; {esc(label(n))}</span>"
+             for n in names]
     return ("<div class='key'>" + " · ".join(items) + "</div>") if items else ""
 
 
@@ -690,45 +802,26 @@ def live_text(addr: str) -> str:
             + (TZ.tzname(datetime.fromisoformat(got["ts"])) if TZ else "UTC"))
 
 
-async def live_forever(interval: float, turn_scan: float,
-                       connect_wait: float) -> None:
+async def live_forever(devices: dict, interval: float, turn_scan: float,
+                      connect_wait: float) -> None:
     """Keep the GATT sessions open and poll the devices one at a time.
 
     One cycle takes the next device in the rotation and runs a short active
     scan for it, so two thermometers never compete for the adapter at once.
-
-    devices.json is re-read at the top of every cycle, so a device added from
-    the settings screen is polled on the next turn without restarting the viewer;
-    only the addresses that were not known before get a session opened, so the
-    ones already polling keep theirs.
     """
     import thermwatch  # sits in the same folder
 
-    sessions, connected, order = [], {}, []
+    sessions, connected = await thermwatch.open_sessions(
+        list(devices), connect_wait)
+    LIVE_INFO["connected"] = connected
+    order = list(devices)
     i = 0
     LIVE_INFO["started"] = datetime.now(timezone.utc).isoformat(
         timespec="seconds")
     while True:
-        devices = config_names()
-        new = [a for a in devices if a not in connected]
-        if new:
-            got, got_conn = await thermwatch.open_sessions(new, connect_wait)
-            # A GATT session only holds its device while this process still has
-            # the object, so every session opened stays in this list.
-            sessions += got
-            connected.update(got_conn)
-            print(f"[live] devices.json names {len(new)} device(s) not polled "
-                  "before - sessions opened", flush=True)
-        if set(devices) != set(order):
-            order = list(devices)
-            i = 0
-        LIVE_INFO["connected"] = connected
-        if not order:
-            await asyncio.sleep(max(interval - turn_scan, 0.5))
-            continue
         addr = order[i % len(order)]
         i += 1
-        LIVE_INFO["next"] = order[i % len(order)]
+        LIVE_INFO["next"] = order[i % len(order)] if order else None
         found = await thermwatch.scan(turn_scan)
         # Whatever answered gets stored, so a scan that catches the other
         # thermometer is not thrown away; the rotation decides which one to
@@ -747,18 +840,15 @@ async def live_forever(interval: float, turn_scan: float,
         await asyncio.sleep(max(interval - turn_scan, 0.5))
 
 
-def start_live(interval: float, turn_scan: float,
+def start_live(devices: dict, interval: float, turn_scan: float,
                connect_wait: float) -> None:
-    """Run live_forever in its own thread; the HTTP server stays single.
-
-    No device list is passed in: the poll reads devices.json itself, once a
-    cycle, so the settings screen can add one while this is running.
-    """
+    """Run live_forever in its own thread; the HTTP server stays single."""
     LIVE_INFO["note"] = "starting"
 
     def run():
         try:
-            asyncio.run(live_forever(interval, turn_scan, connect_wait))
+            asyncio.run(live_forever(devices, interval, turn_scan,
+                                     connect_wait))
         except Exception as e:            # a dead device must not kill the page
             LIVE_INFO["note"] = f"stopped: {e}"
             print(f"[live] stopped: {e}", flush=True)
@@ -774,11 +864,13 @@ def live_status(all_count: int) -> str:
 
 def live_state() -> dict:
     """The live panel as data - every device is listed, so a span that went
-    stale is rewritten too, not only the ones that still answer. A device named
-    in devices.json but never polled is listed as well, saying why.
+    stale is rewritten too, not only the ones that still answer.
     """
-    addrs = known_addresses()
-    return {"status": live_status(len(addrs)),
+    addrs = list(Store.addresses())
+    for a in config_names():
+        if a not in addrs:
+            addrs.append(a)
+    return {"status": live_status(len(Store.addresses())),
             "devices": {a: {"text": live_text(a),
                             "ts": LIVE.get(a, {}).get("ts", "")}
                         for a in addrs}}
@@ -823,16 +915,14 @@ def live_js(seconds: float) -> str:
 
 def side_html(selected: list, all_names: list, keep: dict) -> str:
     """The device menu. Clicking a device adds or drops it, keeping the rest."""
-    lines = [f"<p class='m'>{len(all_names)} device(s) known · "
+    lines = [f"<p class='m'>{len(all_names)} device(s) in the store · "
              f"selected {len(selected)} · names come from devices.json, so a "
-             "rename is a label, not a new device · one named there is listed "
-             "before it has any data, so a new thermometer shows up on this "
-             "page as soon as it is added</p>",
+             "rename is a label, not a new device</p>",
              f"<p class='m'>live: <span id='lv-status'>"
              f"{esc(live_status(len(all_names)))}</span></p>"]
     low_any = False
     for n in all_names:
-        colour = PALETTE[all_names.index(n) % len(PALETTE)]
+        c = colour(n)
         on = any(norm_name(n) == norm_name(s) for s in selected)
         action = "hide" if on else "show"
         nxt = [x for x in selected if norm_name(x) != norm_name(n)] \
@@ -845,7 +935,7 @@ def side_html(selected: list, all_names: list, keep: dict) -> str:
         bat = LIVE.get(n, {}).get("values", {}).get("battery")
         low = bool(bat and bat[0] <= LOW_BATTERY)
         low_any = low_any or low
-        lines.append(f"<p class='d'><span style='color:{colour}'>&#9632;</span>"
+        lines.append(f"<p class='d'><span style='color:{c}'>&#9632;</span>"
                      f"<a class='{'d low' if low else 'd'}' href='{href}' "
                      f"title='{action} this device'>"
                      f"{esc(label(n))} · {action}</a>"
@@ -855,7 +945,7 @@ def side_html(selected: list, all_names: list, keep: dict) -> str:
         lines.append(f"<p class='m'>a flashing name is a battery at or below "
                      f"{LOW_BATTERY:.0f}% - the reading is still shown, the "
                      "device is what needs attention</p>")
-        lines.append(f"<p class='d'><span style='color:{colour}'>&#9632;</span>"
+        lines.append(f"<p class='d'><span style='color:{c}'>&#9632;</span>"
                      f"<a class='d' href='{href}' title='{action} this device'>"
                      f"{esc(label(n))} · {action}</a>"
                      f"<span class='lv' id='lv-{norm_address(n)}'>"
@@ -1008,6 +1098,13 @@ select.r,select.tz{margin:.4rem 0}
    button is pressed. */
 .dev{border:1px solid #2b333b;border-radius:.4rem;padding:.5rem .7rem;
       margin:.5rem 0;background:#141819}
+/* The colour chips: a row of clickable swatches, so choosing a colour is one
+   click on the colour rather than finding a name in a list. The ringed one is
+   what the device is drawn in now. */
+.sw{display:inline-block;width:1.15rem;height:.95rem;margin:0 .12rem .3rem .12rem;
+    border:#2b333b solid 1px;border-radius:.2rem;}
+.sw.on{border:#e8b04a solid 2px;}
+.sw:hover{text-decoration:none;filter:brightness(1.25);}
 .dev code{color:#e8b04a;font-family:monospace}
 .dev input,.dev select{display:inline-block}
 .rpt{color:#e8b04a;font-size:.85rem}
@@ -1030,7 +1127,7 @@ img.g{width:100%;height:auto}
 
 def series_of(params: dict) -> tuple:
     """(addresses shown, kinds asked for, range text, row count, series)."""
-    all_names = known_addresses()
+    all_names = Store.addresses()
     selected = pick_devices(params.get("dev"), all_names)
     frm, to, desc = span(params)
     if not selected:
@@ -1076,7 +1173,7 @@ def shot_links(params: dict) -> str:
 
 
 def page(params: dict) -> str:
-    all_names = known_addresses()
+    all_names = Store.addresses()
     selected, kinds, label, nrows, series = series_of(params)
 
     kinds = kinds_of(params)
@@ -1170,10 +1267,8 @@ def set_name(address: str, name: str) -> str:
     if hit is None:
         out[name] = address
     write_config(out)
-    if hit is not None:
-        return f"renamed {addr} to {name}" + " in devices.json"
-    return (f"added {name} at {addr} in devices.json - the live poll reaches "
-            "it on its next turn, so it is on the main page from now")
+    return (f"renamed {addr} to {name}" if hit is not None else
+            f"added {name} at {addr}") + " in devices.json"
 
 
 def import_history(name: str, file_name: str) -> str:
@@ -1215,6 +1310,14 @@ def seen_by_scan(seconds: float) -> tuple[list, str]:
 # answers an active scan only after a while; 8 s found the ones in range in
 # earlier runs, and the page says so rather than pretending it is instant.
 SCAN_S = 8.0
+
+# What the settings screen's scan is doing. It is state, not part of an
+# address: it describes a run of the tool, like the live poll's own state, so
+# the screen can be re-read while the scan works and show what answered when it
+# lands. `found` is what the last finished scan answered, kept so the screen
+# still lists those devices until another scan replaces it.
+Scan = {"since": None, "seconds": 0.0, "found": [],
+        "note": "no scan run - click find one for that"}
 
 
 def value_counts(imported_only: bool = False) -> dict:
@@ -1376,6 +1479,75 @@ def zone_form() -> str:
             f"onchange='pick(this)'>{opts}</select></form>")
 
 
+def colour_choices(addr: str) -> str:
+    """The row of colour chips one device's block offers.
+
+    Clicking a chip is the same navigation the settings dropdown used to make:
+    `/devices?address=<addr>&c=<colour>` saves it and redraws the screen, so the
+    choice is not one click behind a Save button. The chips are links, not form
+    controls - the colour belongs to the address, like every other state here,
+    and a row of chips is one click instead of finding a name in a list. The
+    first chip is **the tool's pick**: it is drawn as the colour this device
+    would get from the palette, so pressing it is visible rather than a name.
+    The rest of the row is the whole hue wheel - 24 steps, so a device can be
+    set to any colour and not to one of eight. The chip in use is ringed.
+    """
+    cur = colour_doc().get(norm_address(addr), "")
+    if not is_colour(cur):
+        cur = ""
+    picks = [("", "the tool's pick")] + [
+        (c, f"hue {i * 360 // len(WHEEL)} deg") for i, c in enumerate(WHEEL)]
+    if cur and cur not in {v for v, _n in picks}:
+        picks.insert(1, (cur, f"its own colour {cur}"))
+    cells = []
+    for value, name in picks:
+        shown = colour(addr) if not value else value
+        cls = "sw on" if value == cur else "sw"
+        cells.append(f"<a class='{cls}' "
+                     f"style='background:{shown}' "
+                     f"href='/devices?address={norm_address(addr)}"
+                     f"&amp;c={_q(value)}' title='{esc(name)}'>&nbsp;</a>")
+    return (f"<p class='m'>this device's colour - click one, it applies "
+            "straight away · the ringed chip is the one in use</p>" +
+            "".join(cells))
+
+
+def run_scan(seconds: float) -> None:
+    """One background scan: run it, remember what answered.
+
+    The scan is the one thing the settings screen does that takes seconds, and
+    it competes with the live poll for the Bluetooth adapter - which is why it
+    only runs when the find link is clicked. Running it in a thread rather than
+    inside the request is what lets the screen be re-read, the range changed and
+    the settings opened while it works: the page answers straight away and the
+    devices that answered appear on the next look, the same way a live poll's
+    readings do. Nothing here touches the viewer's sqlite connection - the scan
+    reads Bluetooth and `devices.json`, so no thread shares a connection.
+    """
+    found, note = seen_by_scan(seconds)
+    Scan["found"], Scan["note"], Scan["since"] = found, note, None
+
+
+def start_scan(seconds: float) -> str:
+    """Start a background scan, or say one is already running."""
+    if Scan["since"] is not None:
+        return "already running"
+    Scan["since"] = time.time()
+    Scan["seconds"] = seconds
+    threading.Thread(target=run_scan, args=(seconds,),
+                     name="thermview-scan", daemon=True).start()
+    return "started"
+
+
+def scan_note() -> str:
+    """What can be said now about the scan the settings screen asked for."""
+    if Scan["since"] is not None:
+        return (f"a {Scan['seconds']:.0f}s scan is running "
+                f"({time.time() - Scan['since']:.0f}s so far) - the devices "
+                "that answered are shown when it lands")
+    return Scan["note"]
+
+
 def devices_page(params: dict, report: list = ()) -> str:
     """The devices screen.
 
@@ -1416,6 +1588,18 @@ def devices_page(params: dict, report: list = ()) -> str:
              "°C, nothing was converted in it"
              if got else
              f"'{params['unit'][0]}' is not a unit - the choice was not saved")]
+    if params.get("c"):
+        addr = norm_address(params.get("address", [""])[0])
+        want = (params["c"][0] or "").strip()
+        got = save_colour(addr, want) if addr else None
+        report = list(report) + [
+            (f"{addr} is drawn in {got} now - the panel, the key and the "
+             "graph lines all use it" if got else
+             "the tool's pick is back for that device - the palette slot it "
+             "had, and colours.json no longer names it" if not want else
+             f"'{want}' is not a colour (#rrggbb) - the choice was not saved")
+            if got or (not want and addr) else
+            f"no device was named in the address - the colour was not saved"]
     pick_display(params)
     # The view you came from is part of this screen: the range, the date and
     # the devices chosen are carried so "back to the graphs" lands where you
@@ -1428,7 +1612,13 @@ def devices_page(params: dict, report: list = ()) -> str:
     except ValueError:
         seconds = 0.0
     if seconds > 0:
-        seen, note = seen_by_scan(seconds)
+        got = start_scan(seconds)
+        report = list(report) + [
+            (f"a {seconds:.0f}s scan is running - keep browsing or change the "
+             "range, this screen comes back with what answered when it lands")
+            if got == "started" else
+            "a scan is already running - this click did not start a second one"]
+    seen, note = Scan["found"], scan_note()
     order = list(dict.fromkeys(
         list(cfg) + [a for a in stored if a not in cfg]
         + [a for a, _n in seen if a not in cfg]))
@@ -1472,7 +1662,9 @@ def devices_page(params: dict, report: list = ()) -> str:
                  f"<code>{esc(windows)}</code></p>" if windows else "")
         held = counts.get(addr, 0)
         out.append(
-            f"<div class='dev'><p class='m'>{esc(name or '(no name)')} "
+            f"<div class='dev'><p class='m'>"
+            f"<span style='color:{colour(addr)}'>&#9632;</span> "
+            f"{esc(name or '(no name)')} "
             f"<code>{addr}</code> · {where} · "
             f"{held} value row(s) came from a historical file</p>{found}"
             f"<form method='post' action='/devices'>"
@@ -1487,7 +1679,9 @@ def devices_page(params: dict, report: list = ()) -> str:
             f"value='remove this file's data'>"
             f"<input type='submit' name='delete' "
             f"value='delete all data for this device'>"
-            "</form></div>")
+            "</form>"
+            + colour_choices(addr) +
+            "</div>")
     if not order:
         out.append("<p class='m'>no device is named anywhere - add one by "
                    "name and address in devices.json, or click find one</p>")
@@ -1686,12 +1880,12 @@ def main() -> int:
     tag = args.tag or Path(__file__).resolve().parent.name
     sys.stdout = Prefixed(sys.stdout, tag)
     sys.stderr = Prefixed(sys.stderr, tag)
+    devices = config_names()
     LIVE_INFO["refresh"] = args.live_refresh
-    if args.live_interval > 0:
-        # No device list here: the poll reads devices.json once a cycle, so a
-        # device added from the settings screen is picked up without restarting.
+    if args.live_interval > 0 and devices:
         LIVE_INFO["interval"] = args.live_interval
-        start_live(args.live_interval, args.turn_scan, args.connect_wait)
+        start_live(devices, args.live_interval, args.turn_scan,
+                   args.connect_wait)
     else:
         LIVE_INFO["note"] = "off (--live-interval 0)"
     srv = HTTPServer(("127.0.0.1", args.port), Request)

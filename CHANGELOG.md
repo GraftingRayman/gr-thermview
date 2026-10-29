@@ -3,6 +3,50 @@
 Everything here was verified against the store or the page before it was
 written down. Dates are the day the change was made on this machine.
 
+## 2026-10-29 — a colour per device, a whole hue wheel, and a page that stops re-walking the store
+
+Three things, all measured against the real store before being written down.
+
+- **A device's colour is its own.** The panel, the graph key and the graph lines
+  used to derive a colour from a position in a list — the drawn subset in one
+  place, the store's full list in another — so choosing a subset with `dev=`
+  shifted the graph's colours while the live panel's stayed. One lookup,
+  `colour(name)`, keyed by the store's device list, now answers for all three.
+  Verified for all seven devices in this copy's store: each one's panel swatch,
+  key square and line stroke are the same colour, and a three-device page draws
+  exactly the three colours the panel shows.
+- **Each device can be given a colour from the settings screen.** `colours.json`
+  maps **address → `#rrggbb`** — the address is the identity, so a rename keeps a
+  colour and a device that is only in the store can be coloured before it is
+  named. The device block carries a row of **clickable chips**: the tool's pick
+  first, drawn as the colour this device would actually get from the palette, then
+  **the whole hue wheel** — `spectrum(24)`, 24 distinct hues at one saturation and
+  lightness, because both ends of that axis are unreadable on the dark page. The
+  chip in use is ringed; a colour set outside the row is added as its own chip.
+  Clicking applies straight away through `/devices?address=…&c=…`. `PALETTE` is
+  now only the fallback for a device with no chosen colour, not the limit of what
+  can be picked.
+- **The settings scan runs in the background.** Clicking find-one used to block
+  the single-threaded server for 8 s. It is a thread now; the screen answers in
+  milliseconds, says `a 8s scan is running (3s so far)` until it lands, and a
+  second click while one runs says so and starts nothing. Measured: the click
+  answered in 0.76 s while the scan takes 8 s.
+- **A page stopped taking a minute.** The profile put it on `Store.addresses()`:
+  called once per device in the panel, the key and every graph line, each call
+  re-running a `GROUP BY` over 1 186 286 reading rows. The store view keeps the
+  device list and the month list until the file's stamp changes, which took a warm
+  page from **43–59 s to 1.2–1.3 s** and the settings screen from 8.3 s to
+  **0.76 s**. The cache is dropped when the file moves, so a run that wrote the
+  store is still seen on the next request — the behaviour the docs already promised.
+
+**The suite in this copy is not in line with the code in it.** The code here was
+copied from the tool folder on this date, and that folder's viewer was changed on
+2026-10-26 in a way that reverted the two features the 2026-10-25 entry above
+describes: `known_addresses()` is gone and the live poll reads `devices.json`
+once at startup again. The suite still tests the older behaviour, so it stops at
+an `AttributeError` and reports no total. That is a decision about the tool, not
+about this copy; it is recorded here so the two folders are read honestly.
+
 ## 2026-10-25 — a device you add is on the page and in the poll right away
 
 The complaint this answers: a thermometer paired with Windows and named from the
